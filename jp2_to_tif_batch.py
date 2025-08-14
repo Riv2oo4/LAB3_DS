@@ -1,107 +1,131 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-jp2_to_tif_batch.py
-Convierte Sentinel-2 JP2 -> GeoTIFF y (opcional) recorta al AOI.
-- Busca automáticamente B04_10m.jp2, B08_10m.jp2 y SCL_20m.jp2 (o QA60_60m.jp2)
-  dentro de una carpeta (por defecto: ./DATA), sin importar nombres exactos.
-
-Uso:
-  python jp2_to_tif_batch.py --data-dir ./DATA --prefix 2020 --aoi aoi.geojson
-  python jp2_to_tif_batch.py --data-dir ./DATA_2024 --prefix 2024 --aoi aoi.geojson
-
-Requisitos: pip install rasterio
-"""
-import os
-import sys
-import json
-import argparse
-import glob
+import os, glob
+import numpy as np
 import rasterio
-from rasterio.mask import mask
+from rasterio.warp import reproject, Resampling
+import matplotlib.pyplot as plt
 
-def read_aoi(geojson_path):
-    if not geojson_path or not os.path.exists(geojson_path):
-        return None
-    with open(geojson_path, "r", encoding="utf-8") as f:
-        gj = json.load(f)
-    if gj.get("type") == "FeatureCollection":
-        return [feat["geometry"] for feat in gj["features"]]
-    if gj.get("type") == "Feature":
-        return [gj["geometry"]]
-    return [gj]  # geometry directa
+# === Carpetas  ===
+DIR20 = "./DATA2020"
+DIR24 = "./DATA2024"
+OUT_DIR = "./salidas_tif_2024"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-def find_one(data_dir, patterns):
-    for pat in patterns:
-        hits = sorted(glob.glob(os.path.join(data_dir, "**", pat), recursive=True))
-        if hits:
-            return hits[0]
-    return None
+def find_band(dirpath, band_tag):
+    patt = os.path.join(dirpath, f"*{band_tag}*.tif*")
+    files = sorted(glob.glob(patt))
+    if not files:
+        raise FileNotFoundError(f"No encontré {band_tag} en {dirpath}")
+    return files[0]
 
-def transcode(in_path, out_path, aoi_geom=None):
-    if in_path is None:
-        return None
-    with rasterio.open(in_path) as src:
+def read_band(path):
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype("float32")
         profile = src.profile
-        profile.update(driver="GTiff")
-        if aoi_geom:
-            arr, transform = mask(src, aoi_geom, crop=True)
-            profile.update(height=arr.shape[1], width=arr.shape[2], transform=transform)
-            with rasterio.open(out_path, "w", **profile) as dst:
-                dst.write(arr)
-        else:
-            with rasterio.open(out_path, "w", **profile) as dst:
-                dst.write(src.read())
-    print(f"[OK] {os.path.basename(out_path)}")
-    return out_path
+        transform = src.transform
+        crs = src.crs
+        nodata = src.nodata
+    return arr, profile, transform, crs, nodata
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data-dir", default="./DATA", help="Carpeta con los JP2 (búsqueda recursiva).")
-    ap.add_argument("--prefix",   default="2020",   help="Sufijo para nombres de salida (2020/2024).")
-    ap.add_argument("--aoi",      default="",       help="GeoJSON de AOI para recortar (opcional).")
-    ap.add_argument("--out-dir",  default="",       help="Carpeta de salida (default: ./salidas_tif_<prefix>).")
-    args = ap.parse_args()
+def reproject_to_match(src_path, match_profile):
+    with rasterio.open(src_path) as src:
+        dst = np.empty((match_profile["height"], match_profile["width"]), dtype="float32")
+        reproject(
+            source=rasterio.band(src, 1),
+            destination=dst,
+            src_transform=src.transform,
+            src_crs=src.crs,
+            dst_transform=match_profile["transform"],
+            dst_crs=match_profile["crs"],
+            resampling=Resampling.bilinear,
+        )
+    return dst
 
-    aoi_geom = read_aoi(args.aoi)
-    if aoi_geom:
-        print("[INFO] AOI cargado. Se recortará al polígono.")
-    out_dir = args.out_dir or f"./salidas_tif_{args.prefix}"
-    os.makedirs(out_dir, exist_ok=True)
+def compute_ndvi(nir, red):
+    denom = (nir + red)
+    ndvi = np.where(denom == 0, np.nan, (nir - red) / denom)
+    ndvi = np.clip(ndvi, -1, 1)
+    return ndvi
 
-    # Buscar archivos
-    b04 = find_one(args.data_dir, ["*B04*10m.jp2", "*B04*.jp2"])
-    b08 = find_one(args.data_dir, ["*B08*10m.jp2", "*B08*.jp2"])
-    scl = find_one(args.data_dir, ["*SCL*20m.jp2", "*SCL*.jp2"])
-    qa60= find_one(args.data_dir, ["*QA60*60m.jp2", "*QA60*.jp2"])
+def save_tif(path, arr, profile):
+    prof = profile.copy()
+    prof.update(dtype="float32", count=1, nodata=np.nan)
+    with rasterio.open(path, "w", **prof) as dst:
+        dst.write(arr.astype("float32"), 1)
 
-    if not b04 or not b08:
-        print("[ERROR] No se encontraron B04/B08 en", args.data_dir)
-        print("       Asegúrate de que tus JP2 están en la carpeta o subcarpetas.")
-        sys.exit(2)
+def show(arr, title, vmin=None, vmax=None):
+    plt.figure()
+    plt.imshow(arr, vmin=vmin, vmax=vmax)
+    plt.title(title)
+    plt.axis("off")
+    plt.colorbar()
+    plt.tight_layout()
+    plt.show()
 
-    if not scl and not qa60:
-        print("[WARN] No se encontró SCL ni QA60. Continuaré con B04/B08 solamente.")
+# --- localizar bandas ---
+B04_2020 = find_band(DIR20, "B04")
+B08_2020 = find_band(DIR20, "B08")
+B04_2024 = find_band(DIR24, "B04")
+B08_2024 = find_band(DIR24, "B08")
 
-    # Convertir (y recortar si AOI)
-    b04_tif = os.path.join(out_dir, f"B04_{args.prefix}.tif")
-    b08_tif = os.path.join(out_dir, f"B08_{args.prefix}.tif")
-    transcode(b04, b04_tif, aoi_geom)
-    transcode(b08, b08_tif, aoi_geom)
+print("2020:", os.path.basename(B04_2020), "|", os.path.basename(B08_2020))
+print("2024:", os.path.basename(B04_2024), "|", os.path.basename(B08_2024))
 
-    if scl:
-        scl_tif = os.path.join(out_dir, f"SCL_{args.prefix}.tif")
-        transcode(scl, scl_tif, aoi_geom)
-    elif qa60:
-        qa60_tif = os.path.join(out_dir, f"QA60_{args.prefix}.tif")
-        transcode(qa60, qa60_tif, aoi_geom)
+# --- leer 2020 ---
+red20, prof20, tfm20, crs20, _ = read_band(B04_2020)
+nir20, _, _, _, _ = read_band(B08_2020)
 
-    print("\n[LISTO] GeoTIFFs en:", os.path.abspath(out_dir))
-    print("Usa estas rutas en tu notebook para NDVI y cambio.")
+# Asegurar que B04 y B08 de 2020 estén en el mismo grid
+if red20.shape != nir20.shape:
+    nir20 = reproject_to_match(B08_2020, prof20)
 
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print("[ERROR]", e)
-        sys.exit(1)
+ndvi20 = compute_ndvi(nir20, red20)
+save_tif(os.path.join(OUT_DIR, "NDVI_2020.tif"), ndvi20, prof20)
+
+# --- leer 2024 ---
+red24, prof24, tfm24, crs24, _ = read_band(B04_2024)
+nir24, _, _, _, _ = read_band(B08_2024)
+
+if red24.shape != nir24.shape:
+    nir24 = reproject_to_match(B08_2024, prof24)
+
+ndvi24 = compute_ndvi(nir24, red24)
+save_tif(os.path.join(OUT_DIR, "NDVI_2024.tif"), ndvi24, prof24)
+
+# --- reprojectar NDVI 2020 al grid de 2024  ---
+if ndvi20.shape != ndvi24.shape or (tfm20 != tfm24):
+    tmp_path = os.path.join(OUT_DIR, "NDVI_2020_tmp.tif")
+    save_tif(tmp_path, ndvi20, prof20)
+    ndvi20 = reproject_to_match(tmp_path, prof24)
+
+# --- diferencia (2024 - 2020) ---
+diff = ndvi24 - ndvi20
+save_tif(os.path.join(OUT_DIR, "NDVI_diff_24_minus_20.tif"), diff, prof24)
+
+# --- visualizaciones ---
+show(ndvi20, "NDVI 2020", vmin=-1, vmax=1)
+show(ndvi24, "NDVI 2024", vmin=-1, vmax=1)
+show(diff, "Diferencia NDVI (2024 - 2020)", vmin=-1, vmax=1)
+
+# --- máscara de pérdida significativa ---
+THRESH = -0.2  
+valid = (~np.isnan(ndvi20)) & (~np.isnan(ndvi24))
+deforest_mask = (diff < THRESH) & valid
+save_tif(os.path.join(OUT_DIR, "deforest_mask.tif"), deforest_mask.astype("float32"), prof24)
+show(deforest_mask.astype(int), f"Máscara deforestación (diff < {THRESH})", vmin=0, vmax=1)
+
+# --- hectáreas y porcentaje ---
+px_w = abs(prof24["transform"][0])
+px_h = abs(prof24["transform"][4])
+m2_per_pixel = px_w * px_h
+ha_per_pixel = m2_per_pixel / 10_000.0
+
+defor_pixels = np.count_nonzero(deforest_mask)
+valid_pixels = np.count_nonzero(valid)
+
+defor_ha = defor_pixels * ha_per_pixel
+total_ha = valid_pixels * ha_per_pixel
+defor_pct = (defor_ha / total_ha * 100) if total_ha > 0 else np.nan
+
+print(f"Área analizada (sin NaN): {total_ha:,.2f} ha")
+print(f"Hectáreas con pérdida (umbral {THRESH}): {defor_ha:,.2f} ha")
+print(f"Porcentaje de deforestación: {defor_pct:.2f}%")
